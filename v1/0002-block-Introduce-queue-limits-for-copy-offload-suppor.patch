@@ -1,0 +1,162 @@
+From aafa1361e9963e5a51bc5e95a5e2a855f73c8793 Mon Sep 17 00:00:00 2001
+From: Nitesh Shetty <nj.shetty@samsung.com>
+Date: Mon, 16 Aug 2021 14:58:03 +0530
+Subject: [PATCH 02/10] block: Introduce queue limits for copy-offload support
+
+Add device limits as sysfs entries,
+        - copy_offload (READ_WRITE)
+        - max_copy_sectors (READ_ONLY)
+        - max_copy_ranges_sectors (READ_ONLY)
+        - max_copy_nr_ranges (READ_ONLY)
+
+copy_offload(= 0), is disabled by default. This needs to be enabled if
+copy-offload needs to be used.
+max_copy_sectors = 0, indicates the device doesn't support native copy.
+
+Signed-off-by: Nitesh Shetty <nj.shetty@samsung.com>
+Signed-off-by: SelvaKumar S <selvakuma.s1@samsung.com>
+Signed-off-by: Kanchan Joshi <joshi.k@samsung.com>
+---
+ block/blk-settings.c   |  4 ++++
+ block/blk-sysfs.c      | 51 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/blkdev.h | 12 ++++++++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index b880c70e22e4..818454552cf8 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -57,6 +57,10 @@ void blk_set_default_limits(struct queue_limits *lim)
+ 	lim->misaligned = 0;
+ 	lim->zoned = BLK_ZONED_NONE;
+ 	lim->zone_write_granularity = 0;
++	lim->copy_offload = 0;
++	lim->max_copy_sectors = 0;
++	lim->max_copy_nr_ranges = 0;
++	lim->max_copy_range_sectors = 0;
+ }
+ EXPORT_SYMBOL(blk_set_default_limits);
+ 
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 9f32882ceb2f..dc68ae6b55c9 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -171,6 +171,48 @@ static ssize_t queue_discard_granularity_show(struct request_queue *q, char *pag
+ 	return queue_var_show(q->limits.discard_granularity, page);
+ }
+ 
++static ssize_t queue_copy_offload_show(struct request_queue *q, char *page)
++{
++	return queue_var_show(q->limits.copy_offload, page);
++}
++
++static ssize_t queue_copy_offload_store(struct request_queue *q,
++				       const char *page, size_t count)
++{
++	unsigned long copy_offload;
++	ssize_t ret = queue_var_store(&copy_offload, page, count);
++
++	if (ret < 0)
++		return ret;
++
++	if (copy_offload && q->limits.max_copy_sectors == 0)
++		return -EINVAL;
++
++	if (copy_offload)
++		q->limits.copy_offload = BLK_COPY_OFFLOAD;
++	else
++		q->limits.copy_offload = 0;
++
++	return ret;
++}
++
++static ssize_t queue_max_copy_sectors_show(struct request_queue *q, char *page)
++{
++	return queue_var_show(q->limits.max_copy_sectors, page);
++}
++
++static ssize_t queue_max_copy_range_sectors_show(struct request_queue *q,
++		char *page)
++{
++	return queue_var_show(q->limits.max_copy_range_sectors, page);
++}
++
++static ssize_t queue_max_copy_nr_ranges_show(struct request_queue *q,
++		char *page)
++{
++	return queue_var_show(q->limits.max_copy_nr_ranges, page);
++}
++
+ static ssize_t queue_discard_max_hw_show(struct request_queue *q, char *page)
+ {
+ 
+@@ -597,6 +639,11 @@ QUEUE_RO_ENTRY(queue_nr_zones, "nr_zones");
+ QUEUE_RO_ENTRY(queue_max_open_zones, "max_open_zones");
+ QUEUE_RO_ENTRY(queue_max_active_zones, "max_active_zones");
+ 
++QUEUE_RW_ENTRY(queue_copy_offload, "copy_offload");
++QUEUE_RO_ENTRY(queue_max_copy_sectors, "max_copy_sectors");
++QUEUE_RO_ENTRY(queue_max_copy_range_sectors, "max_copy_range_sectors");
++QUEUE_RO_ENTRY(queue_max_copy_nr_ranges, "max_copy_nr_ranges");
++
+ QUEUE_RW_ENTRY(queue_nomerges, "nomerges");
+ QUEUE_RW_ENTRY(queue_rq_affinity, "rq_affinity");
+ QUEUE_RW_ENTRY(queue_poll, "io_poll");
+@@ -643,6 +690,10 @@ static struct attribute *queue_attrs[] = {
+ 	&queue_discard_max_entry.attr,
+ 	&queue_discard_max_hw_entry.attr,
+ 	&queue_discard_zeroes_data_entry.attr,
++	&queue_copy_offload_entry.attr,
++	&queue_max_copy_sectors_entry.attr,
++	&queue_max_copy_range_sectors_entry.attr,
++	&queue_max_copy_nr_ranges_entry.attr,
+ 	&queue_write_same_max_entry.attr,
+ 	&queue_write_zeroes_max_entry.attr,
+ 	&queue_zone_append_max_entry.attr,
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index efed3820cbf7..f63ae50f1de3 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -51,6 +51,12 @@ extern struct class block_class;
+ /* Doing classic polling */
+ #define BLK_MQ_POLL_CLASSIC -1
+ 
++/* Define copy offload options */
++enum blk_copy {
++	BLK_COPY_EMULATE = 0,
++	BLK_COPY_OFFLOAD,
++};
++
+ /*
+  * Maximum number of blkcg policies allowed to be registered concurrently.
+  * Defined here to simplify include dependency.
+@@ -253,6 +259,10 @@ struct queue_limits {
+ 	unsigned int		discard_granularity;
+ 	unsigned int		discard_alignment;
+ 	unsigned int		zone_write_granularity;
++	unsigned int            copy_offload;
++	unsigned int            max_copy_sectors;
++	unsigned short          max_copy_range_sectors;
++	unsigned short          max_copy_nr_ranges;
+ 
+ 	unsigned short		max_segments;
+ 	unsigned short		max_integrity_segments;
+@@ -562,6 +572,7 @@ struct request_queue {
+ #define QUEUE_FLAG_RQ_ALLOC_TIME 27	/* record rq->alloc_time_ns */
+ #define QUEUE_FLAG_HCTX_ACTIVE	28	/* at least one blk-mq hctx is active */
+ #define QUEUE_FLAG_NOWAIT       29	/* device supports NOWAIT */
++#define QUEUE_FLAG_COPY		30	/* supports copy offload */
+ 
+ #define QUEUE_FLAG_MQ_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+ 				 (1 << QUEUE_FLAG_SAME_COMP) |		\
+@@ -585,6 +596,7 @@ bool blk_queue_flag_test_and_set(unsigned int flag, struct request_queue *q);
+ #define blk_queue_io_stat(q)	test_bit(QUEUE_FLAG_IO_STAT, &(q)->queue_flags)
+ #define blk_queue_add_random(q)	test_bit(QUEUE_FLAG_ADD_RANDOM, &(q)->queue_flags)
+ #define blk_queue_discard(q)	test_bit(QUEUE_FLAG_DISCARD, &(q)->queue_flags)
++#define blk_queue_copy(q)	test_bit(QUEUE_FLAG_COPY, &(q)->queue_flags)
+ #define blk_queue_zone_resetall(q)	\
+ 	test_bit(QUEUE_FLAG_ZONE_RESETALL, &(q)->queue_flags)
+ #define blk_queue_secure_erase(q) \
+-- 
+2.30.0-rc0
+

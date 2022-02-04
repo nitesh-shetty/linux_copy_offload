@@ -1,0 +1,216 @@
+From 8b02bf26006bd7cd57bcd97db9a6c858d2405f98 Mon Sep 17 00:00:00 2001
+From: Arnav Dawn <arnav.dawn@samsung.com>
+Date: Tue, 4 Jan 2022 23:54:38 +0530
+Subject: [PATCH 07/10] nvmet: add copy command support for bdev and file ns
+
+Add support for handling target command on target.
+For bdev-ns we call into blkdev_issue_copy, which the block layer
+completes by a offloaded copy request to backend bdev or by emulating the
+request.
+
+For file-ns we call vfs_copy_file_range to service our request.
+
+Currently target always shows copy capability by setting
+NVME_CTRL_ONCS_COPY in controller ONCS.
+
+Signed-off-by: Arnav Dawn <arnav.dawn@samsung.com>
+Signed-off-by: Nitesh Shetty <nj.shetty@samsung.com>
+---
+ drivers/nvme/target/admin-cmd.c   |  8 +++-
+ drivers/nvme/target/io-cmd-bdev.c | 66 +++++++++++++++++++++++++++++++
+ drivers/nvme/target/io-cmd-file.c | 48 ++++++++++++++++++++++
+ 3 files changed, 120 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/nvme/target/admin-cmd.c b/drivers/nvme/target/admin-cmd.c
+index 6fb24746de06..cbb967344d1d 100644
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@ -431,8 +431,7 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
+ 	id->nn = cpu_to_le32(NVMET_MAX_NAMESPACES);
+ 	id->mnan = cpu_to_le32(NVMET_MAX_NAMESPACES);
+ 	id->oncs = cpu_to_le16(NVME_CTRL_ONCS_DSM |
+-			NVME_CTRL_ONCS_WRITE_ZEROES);
+-
++			NVME_CTRL_ONCS_WRITE_ZEROES | NVME_CTRL_ONCS_COPY);
+ 	/* XXX: don't report vwc if the underlying device is write through */
+ 	id->vwc = NVME_CTRL_VWC_PRESENT;
+ 
+@@ -530,6 +529,11 @@ static void nvmet_execute_identify_ns(struct nvmet_req *req)
+ 
+ 	if (req->ns->bdev)
+ 		nvmet_bdev_set_limits(req->ns->bdev, id);
++	else {
++		id->msrc = to0based(BIO_MAX_VECS);
++		id->mssrl = cpu_to_le32(BIO_MAX_VECS << (PAGE_SHIFT - SECTOR_SHIFT));
++		id->mcl = cpu_to_le64(le32_to_cpu(id->mssrl) * BIO_MAX_VECS);
++	}
+ 
+ 	/*
+ 	 * We just provide a single LBA format that matches what the
+diff --git a/drivers/nvme/target/io-cmd-bdev.c b/drivers/nvme/target/io-cmd-bdev.c
+index 95c2bbb0b2f5..9b403f394f21 100644
+--- a/drivers/nvme/target/io-cmd-bdev.c
++++ b/drivers/nvme/target/io-cmd-bdev.c
+@@ -46,6 +46,30 @@ void nvmet_bdev_set_limits(struct block_device *bdev, struct nvme_id_ns *id)
+ 	id->npda = id->npdg;
+ 	/* NOWS = Namespace Optimal Write Size */
+ 	id->nows = to0based(ql->io_opt / ql->logical_block_size);
++
++	/*Copy limits*/
++	if (ql->max_copy_sectors) {
++		id->mcl = cpu_to_le64((ql->max_copy_sectors << 9) / ql->logical_block_size);
++		id->mssrl = cpu_to_le32((ql->max_copy_range_sectors << 9) /
++				ql->logical_block_size);
++		id->msrc = to0based(ql->max_copy_nr_ranges);
++	} else {
++		if (ql->zoned == BLK_ZONED_NONE) {
++			id->msrc = to0based(BIO_MAX_VECS);
++			id->mssrl = cpu_to_le32(
++					(BIO_MAX_VECS << PAGE_SHIFT) / ql->logical_block_size);
++			id->mcl = cpu_to_le64(le32_to_cpu(id->mssrl) * BIO_MAX_VECS);
++#ifdef CONFIG_BLK_DEV_ZONED
++		} else {
++			/* TODO: get right values for zoned device */
++			id->msrc = to0based(BIO_MAX_VECS);
++			id->mssrl = cpu_to_le32(min((BIO_MAX_VECS << PAGE_SHIFT),
++					ql->chunk_sectors) / ql->logical_block_size);
++			id->mcl = cpu_to_le64(min(le32_to_cpu(id->mssrl) * BIO_MAX_VECS,
++						ql->chunk_sectors));
++#endif
++		}
++	}
+ }
+ 
+ void nvmet_bdev_ns_disable(struct nvmet_ns *ns)
+@@ -433,6 +457,44 @@ static void nvmet_bdev_execute_write_zeroes(struct nvmet_req *req)
+ 	}
+ }
+ 
++static void nvmet_bdev_execute_copy(struct nvmet_req *req)
++{
++	struct nvme_copy_range range;
++	struct range_entry *rlist;
++	struct nvme_command *cmnd = req->cmd;
++	sector_t dest, dest_off = 0;
++	int ret, id, nr_range;
++
++	nr_range = cmnd->copy.nr_range + 1;
++	dest = le64_to_cpu(cmnd->copy.sdlba) << req->ns->blksize_shift;
++	rlist = kmalloc_array(nr_range, sizeof(*rlist), GFP_KERNEL);
++
++	for (id = 0 ; id < nr_range; id++) {
++		ret = nvmet_copy_from_sgl(req, id * sizeof(range), &range, sizeof(range));
++		if (ret)
++			goto out;
++
++		rlist[id].dst = dest + dest_off;
++		rlist[id].src = le64_to_cpu(range.slba) << req->ns->blksize_shift;
++		rlist[id].len = (le16_to_cpu(range.nlb) + 1) << req->ns->blksize_shift;
++		rlist[id].comp_len = 0;
++		dest_off += rlist[id].len;
++	}
++	ret = blkdev_issue_copy(req->ns->bdev, nr_range, rlist, req->ns->bdev, GFP_KERNEL,
++			0);
++	if (ret) {
++		for (id = 0 ; id < nr_range; id++) {
++			if (rlist[id].len != rlist[id].comp_len) {
++				req->cqe->result.u32 = cpu_to_le32(id);
++				break;
++			}
++		}
++	}
++out:
++	kfree(rlist);
++	nvmet_req_complete(req, errno_to_nvme_status(req, ret));
++}
++
+ u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)
+ {
+ 	switch (req->cmd->common.opcode) {
+@@ -451,6 +513,10 @@ u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)
+ 	case nvme_cmd_write_zeroes:
+ 		req->execute = nvmet_bdev_execute_write_zeroes;
+ 		return 0;
++	case nvme_cmd_copy:
++		req->execute = nvmet_bdev_execute_copy;
++		return 0;
++
+ 	default:
+ 		return nvmet_report_invalid_opcode(req);
+ 	}
+diff --git a/drivers/nvme/target/io-cmd-file.c b/drivers/nvme/target/io-cmd-file.c
+index 6be6e59d273b..665baa221a43 100644
+--- a/drivers/nvme/target/io-cmd-file.c
++++ b/drivers/nvme/target/io-cmd-file.c
+@@ -347,6 +347,46 @@ static void nvmet_file_dsm_work(struct work_struct *w)
+ 	}
+ }
+ 
++static void nvmet_file_copy_work(struct work_struct *w)
++{
++	struct nvmet_req *req = container_of(w, struct nvmet_req, f.work);
++	int nr_range;
++	loff_t pos;
++	struct nvme_command *cmnd = req->cmd;
++	int ret = 0, len, src, id;
++
++	nr_range = cmnd->copy.nr_range + 1;
++	pos = le64_to_cpu(req->cmd->copy.sdlba) << req->ns->blksize_shift;
++	if (unlikely(pos + req->transfer_len > req->ns->size)) {
++		nvmet_req_complete(req, errno_to_nvme_status(req, -ENOSPC));
++		return;
++	}
++
++	for (id = 0 ; id < nr_range; id++) {
++		struct nvme_copy_range range;
++
++		ret = nvmet_copy_from_sgl(req, id * sizeof(range), &range,
++					sizeof(range));
++		if (ret)
++			goto out;
++
++		len = (le16_to_cpu(range.nlb) + 1) << (req->ns->blksize_shift);
++		src = (le64_to_cpu(range.slba) << (req->ns->blksize_shift));
++		ret = vfs_copy_file_range(req->ns->file, src, req->ns->file, pos, len, 0);
++out:
++		if (ret != len) {
++			pos += ret;
++			req->cqe->result.u32 = cpu_to_le32(id);
++			nvmet_req_complete(req, ret < 0 ? errno_to_nvme_status(req, ret) :
++					errno_to_nvme_status(req, -EIO));
++			return;
++
++		} else
++			pos += len;
++}
++	nvmet_req_complete(req, ret);
++
++}
+ static void nvmet_file_execute_dsm(struct nvmet_req *req)
+ {
+ 	if (!nvmet_check_data_len_lte(req, nvmet_dsm_len(req)))
+@@ -355,6 +395,11 @@ static void nvmet_file_execute_dsm(struct nvmet_req *req)
+ 	schedule_work(&req->f.work);
+ }
+ 
++static void nvmet_file_execute_copy(struct nvmet_req *req)
++{
++	INIT_WORK(&req->f.work, nvmet_file_copy_work);
++	schedule_work(&req->f.work);
++}
+ static void nvmet_file_write_zeroes_work(struct work_struct *w)
+ {
+ 	struct nvmet_req *req = container_of(w, struct nvmet_req, f.work);
+@@ -401,6 +446,9 @@ u16 nvmet_file_parse_io_cmd(struct nvmet_req *req)
+ 	case nvme_cmd_write_zeroes:
+ 		req->execute = nvmet_file_execute_write_zeroes;
+ 		return 0;
++	case nvme_cmd_copy:
++		req->execute = nvmet_file_execute_copy;
++		return 0;
+ 	default:
+ 		return nvmet_report_invalid_opcode(req);
+ 	}
+-- 
+2.30.0-rc0
+

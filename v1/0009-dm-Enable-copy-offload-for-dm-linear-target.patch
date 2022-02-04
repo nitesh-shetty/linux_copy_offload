@@ -1,0 +1,27 @@
+From 91dc35cb2f32da52358b4b148d831319da46602c Mon Sep 17 00:00:00 2001
+From: Nitesh Shetty <nj.shetty@samsung.com>
+Date: Wed, 2 Feb 2022 15:46:53 +0530
+Subject: [PATCH 09/10] dm: Enable copy offload for dm-linear target
+
+Setting copy_supported flag to enable offload.
+
+Signed-off-by: Nitesh Shetty <nj.shetty@samsung.com>
+---
+ drivers/md/dm-linear.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/md/dm-linear.c b/drivers/md/dm-linear.c
+index 1b97a11d7151..8910728bc8df 100644
+--- a/drivers/md/dm-linear.c
++++ b/drivers/md/dm-linear.c
+@@ -62,6 +62,7 @@ static int linear_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 	ti->num_secure_erase_bios = 1;
+ 	ti->num_write_same_bios = 1;
+ 	ti->num_write_zeroes_bios = 1;
++	ti->copy_supported = 1;
+ 	ti->private = lc;
+ 	return 0;
+ 
+-- 
+2.30.0-rc0
+

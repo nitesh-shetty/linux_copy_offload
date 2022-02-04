@@ -1,10 +1,9 @@
-From b9696ce316402448105b714fabe3d454ecadfd06 Mon Sep 17 00:00:00 2001
+From c88a0f2445cce0c95137d24e03f8f32271195ec4 Mon Sep 17 00:00:00 2001
 From: SelvaKumar S <selvakuma.s1@samsung.com>
 Date: Wed, 23 Dec 2020 12:47:07 +0530
 Subject: [PATCH 01/10] block: make bio_map_kern() non static
 
-Make bio_map_kern() non static, so that copy offload/emulation can use
-it to add vmalloced memory to bio.
+Make bio_map_kern() non static
 
 Signed-off-by: SelvaKumar S <selvakuma.s1@samsung.com>
 Signed-off-by: Nitesh Shetty <nj.shetty@samsung.com>

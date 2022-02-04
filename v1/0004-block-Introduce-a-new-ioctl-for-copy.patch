@@ -1,0 +1,103 @@
+From 9d89add26e7bbf74d753cb98c2bfb435e20ab246 Mon Sep 17 00:00:00 2001
+From: Nitesh Shetty <nj.shetty@samsung.com>
+Date: Fri, 4 Feb 2022 20:04:07 +0530
+Subject: [PATCH 04/10] block: Introduce a new ioctl for copy
+
+Add new BLKCOPY ioctl that offloads copying of one or more sources ranges
+to one or more destination in a device. COPY ioctl accepts a 'copy_range'
+structure that contains no of range, a reserved field , followed by an array of
+ranges. Each source range is represented by 'range_entry' that contains
+source start offset, destination start offset and length of source ranges (in bytes)
+
+Signed-off-by: Nitesh Shetty <nj.shetty@samsung.com>
+Signed-off-by: Arnav Dawn <arnav.dawn@samsung.com>
+---
+ block/ioctl.c           | 37 +++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/fs.h |  9 +++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/block/ioctl.c b/block/ioctl.c
+index 4a86340133e4..d77f6143287e 100644
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -124,6 +124,41 @@ static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
+ 	return err;
+ }
+ 
++static int blk_ioctl_copy(struct block_device *bdev, fmode_t mode,
++		unsigned long arg)
++{
++	struct copy_range crange, *ranges;
++	size_t payload_size = 0;
++	int ret;
++
++	if (!(mode & FMODE_WRITE))
++		return -EBADF;
++
++	if (copy_from_user(&crange, (void __user *)arg, sizeof(crange)))
++		return -EFAULT;
++
++	if (unlikely(!crange.nr_range || crange.reserved || crange.nr_range >= MAX_COPY_NR_RANGE))
++		return -EINVAL;
++
++	payload_size = (crange.nr_range * sizeof(struct range_entry)) + sizeof(crange);
++
++	ranges = kmalloc(payload_size, GFP_KERNEL);
++	if (!ranges)
++		return -ENOMEM;
++
++	if (copy_from_user(ranges, (void __user *)arg, payload_size)) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	ret = blkdev_issue_copy(bdev, ranges->nr_range, ranges->range_list, bdev, GFP_KERNEL, 0);
++	if (copy_to_user((void __user *)arg, ranges, payload_size))
++		ret = -EFAULT;
++out:
++	kfree(ranges);
++	return ret;
++}
++
+ static int blk_ioctl_zeroout(struct block_device *bdev, fmode_t mode,
+ 		unsigned long arg)
+ {
+@@ -455,6 +490,8 @@ static int blkdev_common_ioctl(struct block_device *bdev, fmode_t mode,
+ 	case BLKSECDISCARD:
+ 		return blk_ioctl_discard(bdev, mode, arg,
+ 				BLKDEV_DISCARD_SECURE);
++	case BLKCOPY:
++		return blk_ioctl_copy(bdev, mode, arg);
+ 	case BLKZEROOUT:
+ 		return blk_ioctl_zeroout(bdev, mode, arg);
+ 	case BLKGETDISKSEQ:
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index 55bca8f6e8ed..190911ea4311 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -78,6 +78,14 @@ struct range_entry {
+ 	__u64 comp_len;
+ };
+ 
++struct copy_range {
++	__u64 nr_range;
++	__u64 reserved;
++
++	/* Range_list always must be at the end */
++	struct range_entry range_list[];
++};
++
+ /* extent-same (dedupe) ioctls; these MUST match the btrfs ioctl definitions */
+ #define FILE_DEDUPE_RANGE_SAME		0
+ #define FILE_DEDUPE_RANGE_DIFFERS	1
+@@ -199,6 +207,7 @@ struct fsxattr {
+ #define BLKROTATIONAL _IO(0x12,126)
+ #define BLKZEROOUT _IO(0x12,127)
+ #define BLKGETDISKSEQ _IOR(0x12,128,__u64)
++#define BLKCOPY _IOWR(0x12, 129, struct copy_range)
+ /*
+  * A jump here: 130-136 are reserved for zoned block devices
+  * (see uapi/linux/blkzoned.h)
+-- 
+2.30.0-rc0
+
